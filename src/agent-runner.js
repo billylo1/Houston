@@ -5,6 +5,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { parseArgs } from 'node:util';
 import { DEFAULT_INCIDENT_FILE, DEFAULT_ACTION_FILE } from './inspector-trap.js';
+import { isRiskAllowed } from './audit-logger.js';
 
 const { values: flags } = parseArgs({
   options: {
@@ -12,12 +13,14 @@ const { values: flags } = parseArgs({
     'action-file': { type: 'string', default: DEFAULT_ACTION_FILE },
     'audit-log': { type: 'string' },
     model: { type: 'string', default: 'gemini-3.8-flash' },
+    'max-risk': { type: 'string', default: 'low' },
     auto: { type: 'boolean', default: false },
     retry: { type: 'boolean', default: false },
     skip: { type: 'boolean', default: false },
     status: { type: 'boolean', default: false },
     eval: { type: 'string' },
     reason: { type: 'string' },
+    risk: { type: 'string' },
   },
   strict: false,
 });
@@ -136,60 +139,93 @@ const GEMINI_TOOLS = [
       },
       {
         name: 'patch_code_file',
-        description: 'Patch a source code file on disk by replacing an exact string.',
+        description:
+          'Patch a source code file on disk by replacing an exact string. Requires self-assessing the risk level first.',
         parameters: {
           type: 'OBJECT',
           properties: {
             filePath: { type: 'STRING', description: 'Path to the file' },
             search: { type: 'STRING', description: 'Exact string to search for' },
             replace: { type: 'STRING', description: 'Replacement string' },
+            riskLevel: {
+              type: 'STRING',
+              enum: ['low', 'medium', 'high'],
+              description: 'Self-assessed risk level of this code change',
+            },
+            riskJustification: {
+              type: 'STRING',
+              description: 'Why this patch carries this risk level',
+            },
           },
-          required: ['filePath', 'search', 'replace'],
+          required: ['filePath', 'search', 'replace', 'riskLevel', 'riskJustification'],
         },
       },
       {
         name: 'complete_healing',
-        description: 'Finish the live investigation, record the audit reason, and resume the job.',
+        description:
+          'Finish the live investigation, self-assess the risk level of the healing action, record the audit reason, and resume the job.',
         parameters: {
           type: 'OBJECT',
           properties: {
             action: {
               type: 'STRING',
-              enum: ['retry', 'skip', 'abort'],
-              description: '"retry" after fixing state/code, "skip" to bypass item, or "abort"',
+              enum: ['retry', 'skip', 'blocked', 'abort'],
+              description:
+                '"retry" if state/code was safely fixed within allowed risk, "blocked" if the required fix exceeds maxAllowedRisk, "skip" to bypass item, or "abort"',
+            },
+            riskLevel: {
+              type: 'STRING',
+              enum: ['low', 'medium', 'high'],
+              description:
+                'Self-assessed risk level of the healing action: "low" (formatting, date normalization, whitespace trimming), "medium" (defaulting optional metadata, selector tweaks), or "high" (financial amounts, prices, balances, quantities, auth/permissions, core business logic)',
+            },
+            riskJustification: {
+              type: 'STRING',
+              description:
+                'Justification for the chosen riskLevel (why this fix is low, medium, or high risk)',
             },
             reason: {
               type: 'STRING',
-              description: 'Concise explanation of what was investigated and fixed for the human audit log',
+              description: 'Concise explanation of what was investigated and fixed (or blocked) for the human audit log',
             },
           },
-          required: ['action', 'reason'],
+          required: ['action', 'riskLevel', 'riskJustification', 'reason'],
         },
       },
     ],
   },
 ];
 
-async function runGeminiLoop({ incident, cdp, model, actionFile }) {
+async function runGeminiLoop({ incident, cdp, model, maxAllowedRisk = 'low', actionFile }) {
   const apiKey = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
   if (!apiKey) {
     return false;
   }
 
-  console.log(`🛰️  [Houston AI] Investigating "${incident.stepId}" live with ${model}...`);
+  console.log(
+    `🛰️  [Houston AI] Investigating "${incident.stepId}" live with ${model} (maxAllowedRisk="${maxAllowedRisk}")...`,
+  );
   const filesPatched = [];
 
   const systemPrompt = [
     'You are Houston ("Houston, we have a problem... Investigate it live and fix it for me!"), an autonomous V8 runtime debugger for Node.js.',
     'A batch step just threw an error and is paused.',
     'The current item being processed is stored at `globalThis.__houston.currentItem` and shared context at `globalThis.__houston.context`.',
-    '1. Use `eval_runtime` to inspect `globalThis.__houston.currentItem` and mutate any malformed fields in place (e.g. normalizing dates, trimming strings, providing safe defaults).',
-    '2. Or use `read_code_file` / `patch_code_file` if the source file needs a selector or regex fix.',
-    '3. Call `complete_healing` with action="retry" and a clear `reason` for the human audit log.',
+    '',
+    'CRITICAL RISK SELF-ASSESSMENT POLICY:',
+    `The maximum allowed risk level for automatic execution is "${maxAllowedRisk.toUpperCase()}".`,
+    'Before mutating any state or code, you MUST self-assess the risk level ("low", "medium", or "high"):',
+    '- "low": Safe, non-destructive formatting fixes (e.g., converting DD/MM/YYYY date strings to ISO-8601 YYYY-MM-DD, trimming whitespace, normalizing case).',
+    '- "medium": Filling in missing optional non-financial metadata or updating a non-destructive CSS/DOM selector.',
+    '- "high": Modifying financial amounts, prices, royalty fees, account balances, inventory quantities, user/account IDs, permissions, or bypassing security/business validation rules.',
+    '',
+    `If the required fix has a risk level higher than "${maxAllowedRisk}", DO NOT mutate \`globalThis.__houston.currentItem\` or patch files! Instead, immediately call \`complete_healing\` with action="blocked", the assessed \`riskLevel\`, \`riskJustification\`, and \`reason\`.`,
+    `If the fix is within the "${maxAllowedRisk}" threshold, apply the fix via \`eval_runtime\` (or \`patch_code_file\`) and call \`complete_healing\` with action="retry", \`riskLevel\`, \`riskJustification\`, and \`reason\`.`,
   ].join('\n');
 
   const userPrompt = [
     `Step ID: ${incident.stepId}`,
+    `Max Allowed Risk: ${maxAllowedRisk}`,
     `Error: ${incident.error?.message}`,
     `Stack:\n${incident.error?.stack}`,
     `Current Item Preview: ${JSON.stringify(incident.currentItemPreview)}`,
@@ -226,6 +262,8 @@ async function runGeminiLoop({ incident, cdp, model, actionFile }) {
       const updatedItem = cdp ? await cdp.evalRuntime('globalThis.__houston.currentItem') : null;
       writeAction(actionFile, {
         action: args.action,
+        riskLevel: args.riskLevel || 'low',
+        riskJustification: args.riskJustification || null,
         reason: args.reason,
         originalValue: incident.currentItemPreview,
         fixedValue: updatedItem,
@@ -244,18 +282,24 @@ async function runGeminiLoop({ incident, cdp, model, actionFile }) {
         ? { content: fs.readFileSync(target, 'utf8') }
         : { error: `File not found: ${args.filePath}` };
     } else if (name === 'patch_code_file') {
-      const target = path.resolve(args.filePath);
-      if (fs.existsSync(target)) {
-        const content = fs.readFileSync(target, 'utf8');
-        if (content.includes(args.search)) {
-          fs.writeFileSync(target, content.replace(args.search, args.replace), 'utf8');
-          filesPatched.push(target);
-          output = { success: true };
-        } else {
-          output = { error: 'Search string not found' };
-        }
+      if (!isRiskAllowed(args.riskLevel || 'medium', maxAllowedRisk)) {
+        output = {
+          error: `Risk Guardrail Blocked: patch assessed as "${args.riskLevel}" risk, which exceeds maxAllowedRisk="${maxAllowedRisk}".`,
+        };
       } else {
-        output = { error: 'File not found' };
+        const target = path.resolve(args.filePath);
+        if (fs.existsSync(target)) {
+          const content = fs.readFileSync(target, 'utf8');
+          if (content.includes(args.search)) {
+            fs.writeFileSync(target, content.replace(args.search, args.replace), 'utf8');
+            filesPatched.push(target);
+            output = { success: true };
+          } else {
+            output = { error: 'Search string not found' };
+          }
+        } else {
+          output = { error: 'File not found' };
+        }
       }
     }
 
@@ -268,44 +312,115 @@ async function runGeminiLoop({ incident, cdp, model, actionFile }) {
   return false;
 }
 
+const HIGH_RISK_KEY_PATTERN = /(price|amount|balance|royalty|fee|cost|total|salary|payout|usd|cents|quantity|role|permission|auth)/i;
+
 /**
  * Built-in live heuristic healer when running offline or without an LLM API key.
- * Inspects `globalThis.__houston.currentItem` via V8 CDP and repairs common formatting errors
- * (such as DD/MM/YYYY dates or whitespace/casing anomalies).
+ * Inspects `globalThis.__houston.currentItem` via V8 CDP, self-assesses the risk level of
+ * potential repairs, and only executes mutations permitted by `maxAllowedRisk`.
  */
-async function runBuiltInLiveHealer({ incident, cdp, actionFile }) {
+async function runBuiltInLiveHealer({ incident, cdp, maxAllowedRisk = 'low', actionFile }) {
   if (!cdp) return false;
-  console.log('🛰️  [Houston Live Healer] Inspecting V8 runtime memory via CDP...');
+  console.log(
+    `🛰️  [Houston Live Healer] Inspecting V8 runtime memory via CDP (maxAllowedRisk="${maxAllowedRisk}")...`,
+  );
 
   const currentItem = await cdp.evalRuntime('globalThis.__houston.currentItem');
   if (!currentItem || typeof currentItem !== 'object') {
     return false;
   }
 
+  const errMsg = incident.error?.message || '';
+
+  // 1. Check if the failure involves a high-risk financial / sensitive field
+  for (const [key, val] of Object.entries(currentItem)) {
+    const isSensitiveField = HIGH_RISK_KEY_PATTERN.test(key);
+    const isInvalidNumber =
+      isSensitiveField && (typeof val !== 'number' || Number.isNaN(val) || val < 0);
+    const errorMentionsKey =
+      isSensitiveField && errMsg.toLowerCase().includes(key.toLowerCase());
+
+    if (isInvalidNumber || errorMentionsKey) {
+      const assessedRisk = 'high';
+      const riskJustification = `Field "${key}" (${JSON.stringify(val)}) is a sensitive financial/business value; mutating or defaulting it carries HIGH data-integrity risk.`;
+
+      console.log(
+        `⚖️  [Houston Risk Assessment] Assessed RISK=${assessedRisk.toUpperCase()} for "${key}": ${riskJustification}`,
+      );
+
+      if (!isRiskAllowed(assessedRisk, maxAllowedRisk)) {
+        writeAction(actionFile, {
+          action: 'blocked',
+          riskLevel: assessedRisk,
+          riskJustification,
+          reason: `Refused to auto-mutate sensitive field "${key}" (${JSON.stringify(val)}) under maxAllowedRisk="${maxAllowedRisk}"`,
+          originalValue: incident.currentItemPreview,
+          fixedValue: null,
+        });
+        await cdp.resumeAndClose();
+        return true;
+      }
+
+      // Only reached if user explicitly configured maxAllowedRisk: 'high'
+      const safeNumeric = typeof val === 'number' && !Number.isNaN(val) ? Math.abs(val) : 0;
+      await cdp.evalRuntime(
+        `globalThis.__houston.currentItem[${JSON.stringify(key)}] = ${JSON.stringify(safeNumeric)}`,
+      );
+      const updatedItem = await cdp.evalRuntime('globalThis.__houston.currentItem');
+      writeAction(actionFile, {
+        action: 'retry',
+        riskLevel: assessedRisk,
+        riskJustification,
+        reason: `Normalized high-risk field "${key}" from ${JSON.stringify(val)} to ${JSON.stringify(safeNumeric)} (permitted by maxAllowedRisk="${maxAllowedRisk}")`,
+        originalValue: incident.currentItemPreview,
+        fixedValue: updatedItem,
+      });
+      await cdp.resumeAndClose();
+      return true;
+    }
+  }
+
+  // 2. Check for low-risk formatting issues (date format conversion, whitespace trimming)
   let fixed = false;
   const reasons = [];
+  const assessedRisk = 'low';
+  const riskJustification =
+    'Lossless string/date format normalization (converting DD/MM/YYYY to ISO-8601 or trimming whitespace) without altering semantic business values.';
 
   for (const [key, val] of Object.entries(currentItem)) {
     if (typeof val === 'string' && /^\d{2}\/\d{2}\/\d{4}$/.test(val.trim())) {
       const [dd, mm, yyyy] = val.trim().split('/');
       const iso = `${yyyy}-${mm}-${dd}`;
-      await cdp.evalRuntime(`globalThis.__houston.currentItem[${JSON.stringify(key)}] = ${JSON.stringify(iso)}`);
+      if (isRiskAllowed(assessedRisk, maxAllowedRisk)) {
+        await cdp.evalRuntime(
+          `globalThis.__houston.currentItem[${JSON.stringify(key)}] = ${JSON.stringify(iso)}`,
+        );
+      }
       fixed = true;
       reasons.push(`Normalized ${key} from DD/MM/YYYY ("${val}") to ISO-8601 ("${iso}")`);
     } else if (typeof val === 'string' && val !== val.trim()) {
       const trimmed = val.trim();
-      await cdp.evalRuntime(`globalThis.__houston.currentItem[${JSON.stringify(key)}] = ${JSON.stringify(trimmed)}`);
+      if (isRiskAllowed(assessedRisk, maxAllowedRisk)) {
+        await cdp.evalRuntime(
+          `globalThis.__houston.currentItem[${JSON.stringify(key)}] = ${JSON.stringify(trimmed)}`,
+        );
+      }
       fixed = true;
       reasons.push(`Trimmed extraneous whitespace on ${key}`);
     }
   }
 
   if (fixed) {
+    console.log(
+      `⚖️  [Houston Risk Assessment] Assessed RISK=${assessedRisk.toUpperCase()}: ${riskJustification}`,
+    );
     const updatedItem = await cdp.evalRuntime('globalThis.__houston.currentItem');
     const reason = reasons.join('; ');
     console.log(`✅ [Houston Live Healer] Fixed in V8 memory: ${reason}`);
     writeAction(actionFile, {
       action: 'retry',
+      riskLevel: assessedRisk,
+      riskJustification,
       reason,
       originalValue: incident.currentItemPreview,
       fixedValue: updatedItem,
@@ -341,10 +456,14 @@ async function main() {
     process.exit(0);
   }
 
+  const maxAllowedRisk = flags['max-risk'] || incident.maxAllowedRisk || 'low';
+
   if (flags.retry) {
     const updatedItem = cdp ? await cdp.evalRuntime('globalThis.__houston.currentItem') : null;
     writeAction(actionFile, {
       action: 'retry',
+      riskLevel: flags.risk || 'low',
+      riskJustification: 'Manual CLI retry',
       reason: flags.reason || 'Manual CLI retry',
       originalValue: incident.currentItemPreview,
       fixedValue: updatedItem,
@@ -356,6 +475,8 @@ async function main() {
   if (flags.skip) {
     writeAction(actionFile, {
       action: 'skip',
+      riskLevel: 'low',
+      riskJustification: 'Manual CLI skip',
       reason: flags.reason || 'Manual CLI skip',
     });
     await cdp?.resumeAndClose();
@@ -367,15 +488,23 @@ async function main() {
       incident,
       cdp,
       model: flags.model,
+      maxAllowedRisk,
       actionFile,
     });
     if (aiHealed) process.exit(0);
 
-    const heuristicHealed = await runBuiltInLiveHealer({ incident, cdp, actionFile });
+    const heuristicHealed = await runBuiltInLiveHealer({
+      incident,
+      cdp,
+      maxAllowedRisk,
+      actionFile,
+    });
     if (heuristicHealed) process.exit(0);
 
     writeAction(actionFile, {
       action: 'skip',
+      riskLevel: 'low',
+      riskJustification: 'No automated fix applied',
       reason: 'Autonomous healer could not repair item; skipping step.',
     });
     await cdp?.resumeAndClose();
@@ -393,6 +522,8 @@ async function main() {
           const updatedItem = cdp ? await cdp.evalRuntime('globalThis.__houston.currentItem') : null;
           writeAction(actionFile, {
             action: 'retry',
+            riskLevel: 'low',
+            riskJustification: 'Interactive operator retry',
             reason: 'Interactive retry',
             originalValue: incident.currentItemPreview,
             fixedValue: updatedItem,
@@ -401,17 +532,27 @@ async function main() {
           rl.close();
           process.exit(0);
         } else if (cmd === 's' || cmd === 'skip') {
-          writeAction(actionFile, { action: 'skip', reason: 'Interactive skip' });
+          writeAction(actionFile, {
+            action: 'skip',
+            riskLevel: 'low',
+            riskJustification: 'Interactive operator skip',
+            reason: 'Interactive skip',
+          });
           await cdp?.resumeAndClose();
           rl.close();
           process.exit(0);
         } else if (cmd === 'u' || cmd === 'auto') {
           rl.close();
           const healed =
-            (await runGeminiLoop({ incident, cdp, model: flags.model, actionFile })) ||
-            (await runBuiltInLiveHealer({ incident, cdp, actionFile }));
+            (await runGeminiLoop({ incident, cdp, model: flags.model, maxAllowedRisk, actionFile })) ||
+            (await runBuiltInLiveHealer({ incident, cdp, maxAllowedRisk, actionFile }));
           if (!healed) {
-            writeAction(actionFile, { action: 'skip', reason: 'Auto-fix unsuccessful' });
+            writeAction(actionFile, {
+              action: 'skip',
+              riskLevel: 'low',
+              riskJustification: 'Auto-fix unsuccessful',
+              reason: 'Auto-fix unsuccessful',
+            });
             await cdp?.resumeAndClose();
           }
           process.exit(0);

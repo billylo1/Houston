@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
-import { appendAuditEntry } from './audit-logger.js';
+import { appendAuditEntry, isRiskAllowed } from './audit-logger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -100,6 +100,7 @@ export function writeIncident({
   error,
   attempt,
   maxRetries,
+  maxAllowedRisk = 'low',
   relevantFiles = [],
   inspectorUrl,
   auditLogPath,
@@ -111,6 +112,7 @@ export function writeIncident({
     stepId,
     attempt,
     maxRetries,
+    maxAllowedRisk,
     error: {
       name: error?.name || 'Error',
       message: error?.message || String(error),
@@ -127,13 +129,13 @@ export function writeIncident({
   return incident;
 }
 
-export function printHoustonBanner({ stepId, error, inspectorUrl, incidentFile, mode }) {
+export function printHoustonBanner({ stepId, error, inspectorUrl, incidentFile, mode, maxAllowedRisk = 'low' }) {
   console.log('\n' + '═'.repeat(78));
   console.log('🚀 HOUSTON, WE HAVE A PROBLEM... Investigate it live and fix it for me!');
   console.log('─'.repeat(78));
   console.log(`  Step        : ${stepId}`);
   console.log(`  Error       : ${error?.message || error}`);
-  console.log(`  Mode        : ${mode}`);
+  console.log(`  Mode        : ${mode} (Max Auto-Heal Risk: ${maxAllowedRisk.toUpperCase()})`);
   if (inspectorUrl) {
     console.log(`  V8 CDP URL  : ${inspectorUrl}`);
   }
@@ -144,6 +146,7 @@ export function printHoustonBanner({ stepId, error, inspectorUrl, incidentFile, 
 export async function spawnAgentRunner({
   mode,
   model,
+  maxAllowedRisk = 'low',
   incidentFile,
   actionFile,
   auditLogPath,
@@ -158,6 +161,7 @@ export async function spawnAgentRunner({
     '--action-file', actionFile,
     '--audit-log', auditLogPath,
     '--model', model,
+    '--max-risk', maxAllowedRisk,
   ];
 
   if (mode === 'auto') {
@@ -205,6 +209,8 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
   const {
     mode = 'auto',
     model = 'gemini-3.8-flash',
+    maxAllowedRisk = 'low',
+    onRiskExceeded = 'skip',
     maxRetries = 2,
     timeoutMs = 180000,
     port = 9229,
@@ -254,6 +260,7 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
         error,
         attempt: attempts,
         maxRetries,
+        maxAllowedRisk,
         relevantFiles,
         inspectorUrl,
         auditLogPath,
@@ -262,7 +269,7 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
       });
 
       if (!silent) {
-        printHoustonBanner({ stepId, error, inspectorUrl, incidentFile, mode });
+        printHoustonBanner({ stepId, error, inspectorUrl, incidentFile, mode, maxAllowedRisk });
       }
 
       // Pause V8 for any attached CDP debugger
@@ -274,6 +281,7 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
           error,
           incident,
           inspectorUrl,
+          maxAllowedRisk,
           item: globalThis.__houston.currentItem,
           context: globalThis.__houston.context,
         });
@@ -284,6 +292,7 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
         await spawnAgentRunner({
           mode,
           model,
+          maxAllowedRisk,
           incidentFile,
           actionFile,
           auditLogPath,
@@ -292,13 +301,67 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
       }
 
       const resolution = await waitForResolution({ actionFile, timeoutMs });
+      const assessedRisk = (resolution.riskLevel || 'low').toLowerCase();
+      const riskJustification = resolution.riskJustification || null;
+
+      // Enforce Risk Guardrail: block any healing mutation whose assessed risk exceeds maxAllowedRisk
+      if (
+        (resolution.action === 'retry' || resolution.action === 'blocked') &&
+        !isRiskAllowed(assessedRisk, maxAllowedRisk)
+      ) {
+        // Roll back any in-memory mutations made to globalThis.__houston.currentItem
+        if (originalSnapshot !== null && globalThis.__houston.currentItem && typeof globalThis.__houston.currentItem === 'object') {
+          for (const k of Object.keys(globalThis.__houston.currentItem)) {
+            delete globalThis.__houston.currentItem[k];
+          }
+          Object.assign(globalThis.__houston.currentItem, structuredClone(originalSnapshot));
+        } else {
+          globalThis.__houston.currentItem = originalSnapshot;
+        }
+
+        const blockedReason =
+          resolution.reason ||
+          `Blocked ${assessedRisk}-risk healing action (maxAllowedRisk="${maxAllowedRisk}")`;
+
+        const auditRecord = appendAuditEntry({
+          stepId,
+          error: error.message,
+          action: 'blocked',
+          riskLevel: assessedRisk,
+          maxAllowedRisk,
+          riskJustification,
+          originalValue: originalSnapshot,
+          fixedValue: null,
+          reason: blockedReason,
+          filesPatched: [],
+        }, auditLogPath);
+
+        globalThis.__houston.history.push(auditRecord);
+
+        if (!silent) {
+          console.warn(
+            `🛑 [Houston Risk Guard] Blocked ${assessedRisk.toUpperCase()}-risk action on "${stepId}" (maxAllowedRisk="${maxAllowedRisk}"): ${riskJustification || blockedReason}`,
+          );
+        }
+
+        if (onRiskExceeded === 'throw') {
+          throw error;
+        }
+        return null;
+      }
 
       const auditRecord = appendAuditEntry({
         stepId,
         error: error.message,
         action: resolution.action,
+        riskLevel: assessedRisk,
+        maxAllowedRisk,
+        riskJustification,
         originalValue: resolution.originalValue ?? originalSnapshot,
-        fixedValue: resolution.fixedValue ?? globalThis.__houston.currentItem,
+        fixedValue:
+          resolution.action === 'retry'
+            ? (resolution.fixedValue ?? globalThis.__houston.currentItem)
+            : null,
         reason: resolution.reason || resolution.summary || `Resolved with ${resolution.action}`,
         filesPatched: resolution.filesPatched || [],
       }, auditLogPath);
@@ -307,12 +370,14 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
 
       if (resolution.action === 'retry') {
         if (!silent) {
-          console.log(`🔧 [Houston] Live fix applied (${auditRecord.reason}). Retrying "${stepId}"...`);
+          console.log(
+            `🔧 [Houston] Live fix applied [risk=${assessedRisk.toUpperCase()} <= ${maxAllowedRisk.toUpperCase()}] (${auditRecord.reason}). Retrying "${stepId}"...`,
+          );
         }
         continue;
       }
 
-      if (resolution.action === 'skip') {
+      if (resolution.action === 'skip' || resolution.action === 'blocked') {
         if (!silent) {
           console.warn(`⏭️  [Houston] Skipping "${stepId}": ${auditRecord.reason}`);
         }

@@ -15,7 +15,8 @@ When a step fails, Houston prevents your process from crashing: it opens Node's 
 - **Autonomous AI & Offline Heuristic Modes**:
   - With `GOOGLE_API_KEY` or `GEMINI_API_KEY`, Gemini autonomously calls `eval_runtime`, `read_code_file`, `patch_code_file`, and `complete_healing`.
   - Without an API key, Houston's built-in CDP live healer still inspects V8 memory and repairs common date/string formatting issues automatically.
-- **Human-in-the-Loop Audit Log (`houston_audit.jsonl`)**: Every autonomous fix is logged as structured JSONL (original value, fixed value, error, and reasoning) so engineers can review and harden upstream validators the next morning.
+- **Risk Self-Assessment & Guardrails (`maxAllowedRisk`)**: The agent is required to self-assess the risk level (`low`, `medium`, or `high`) and justification of every proposed fix. By default (`maxAllowedRisk: 'low'`), only low-risk formatting normalizations are automatically executed; medium or high-risk mutations (e.g., financial amounts, balances, permissions) are blocked, rolled back in V8 memory if touched, and logged as `"action": "blocked"` for human review.
+- **Human-in-the-Loop Audit Log (`houston_audit.jsonl`)**: Every autonomous fix or blocked high-risk action is logged as structured JSONL (original value, fixed value, assessed risk level, risk justification, error, and reasoning) so engineers can review and harden upstream validators the next morning.
 
 ---
 
@@ -35,6 +36,8 @@ import { Houston } from 'houston-js';
 const houston = new Houston({
   mode: 'auto', // 'auto' | 'interactive' | 'off'
   model: 'gemini-3.8-flash',
+  maxAllowedRisk: 'low', // 'low' (default) | 'medium' | 'high'
+  onRiskExceeded: 'skip', // 'skip' (default) | 'throw'
   auditLogPath: './houston_audit.jsonl',
   maxRetries: 2,
 });
@@ -75,20 +78,30 @@ npm run example
 
 ### What happens when you run `npm run example`:
 1. Article `#101` ingests cleanly.
-2. Article `#102` (`"24/10/2026"`) throws an ISO-8601 validation error.
-3. Houston catches the error, opens the V8 inspector on `127.0.0.1:9229`, and launches the agent:
+2. Article `#102` (`"24/10/2026"`) and `#103` (`"  2026-10-22  "`) throw ISO-8601 date validation errors.
+3. Houston catches each error, opens the V8 inspector on `127.0.0.1:9229`, and launches the agent:
    ```text
    ══════════════════════════════════════════════════════════════════════════════
    🚀 HOUSTON, WE HAVE A PROBLEM... Investigate it live and fix it for me!
    ──────────────────────────────────────────────────────────────────────────────
      Step        : ingest-article-102
      Error       : Invalid ISO-8601 date for article #102 ("Telemetry Deep Dive"): "24/10/2026"
-     Mode        : auto
+     Mode        : auto (Max Auto-Heal Risk: LOW)
      V8 CDP URL  : ws://127.0.0.1:9229/...
    ══════════════════════════════════════════════════════════════════════════════
    ```
-4. The agent inspects `globalThis.__houston.currentItem` over CDP, mutates `publishedAt` to `"2026-10-24"`, appends an entry to `houston_audit.jsonl`, and triggers a retry.
-5. Article `#102` succeeds on retry, and the pipeline finishes all 4 records with zero data loss.
+4. The agent inspects `globalThis.__houston.currentItem` over CDP, self-assesses the date/whitespace normalization as **`LOW` risk** (`<= maxAllowedRisk`), mutates `publishedAt` in live memory, logs the audit record, and retries.
+5. Article `#104` throws an error on a corrupt financial field (`royaltyFee: -450`). The agent self-assesses mutating a monetary value as **`HIGH` risk** (`> maxAllowedRisk="low"`), **blocks** the automatic mutation, logs `"action": "blocked"` to `houston_audit.jsonl` for human review, and safely skips to `#105`.
+
+---
+
+## Risk Self-Assessment Levels
+
+| Risk Level | Examples | Default Behavior (`maxAllowedRisk: 'low'`) |
+| :--- | :--- | :--- |
+| **`low`** | Date format conversion (`DD/MM/YYYY` → `YYYY-MM-DD`), trimming whitespace, casing normalization | ✅ **Auto-executed in V8 memory** |
+| **`medium`** | Defaulting optional non-financial metadata (e.g., missing category tag), updating non-destructive CSS selectors | 🛑 **Blocked & logged** (unless `maxAllowedRisk: 'medium'` or `'high'`) |
+| **`high`** | Modifying financial amounts (`royaltyFee`, `price`, `balance`), inventory quantities, user IDs, or auth permissions | 🛑 **Blocked, rolled back & logged** (unless `maxAllowedRisk: 'high'`) |
 
 ---
 

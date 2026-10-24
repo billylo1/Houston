@@ -3,6 +3,21 @@ import path from 'node:path';
 
 export const DEFAULT_AUDIT_LOG_PATH = path.resolve(process.cwd(), 'houston_audit.jsonl');
 
+export const RISK_LEVELS = {
+  low: 1,
+  medium: 2,
+  high: 3,
+};
+
+/**
+ * Check if an assessed risk level is within the configured maximum allowed risk threshold.
+ */
+export function isRiskAllowed(assessedRisk = 'high', maxAllowedRisk = 'low') {
+  const assessedRank = RISK_LEVELS[String(assessedRisk).toLowerCase()] ?? RISK_LEVELS.high;
+  const allowedRank = RISK_LEVELS[String(maxAllowedRisk).toLowerCase()] ?? RISK_LEVELS.low;
+  return assessedRank <= allowedRank;
+}
+
 /**
  * Append a structured self-healing recovery event to the JSONL audit log.
  */
@@ -12,6 +27,9 @@ export function appendAuditEntry(entry, auditLogPath = DEFAULT_AUDIT_LOG_PATH) {
     stepId: entry.stepId || null,
     error: entry.error || null,
     action: entry.action || 'unknown',
+    riskLevel: entry.riskLevel || 'unknown',
+    maxAllowedRisk: entry.maxAllowedRisk || 'low',
+    riskJustification: entry.riskJustification || null,
     originalValue: entry.originalValue ?? null,
     fixedValue: entry.fixedValue ?? null,
     reason: entry.reason || entry.summary || null,
