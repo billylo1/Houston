@@ -1,0 +1,41 @@
+{
+  "name": "houston-js",
+  "version": "0.1.0",
+  "description": "Houston, we have a problem... Investigate it live and fix it for me! Self-healing runtime framework for Node.js using V8 Inspector and AI.",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./audit": "./src/audit-logger.js"
+  },
+  "bin": {
+    "houston": "./bin/houston.js"
+  },
+  "files": [
+    "src/",
+    "bin/",
+    "examples/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/houston.test.js",
+    "example": "node examples/batch-ingest.js",
+    "example:auto": "node examples/batch-ingest.js --auto"
+  },
+  "keywords": [
+    "self-healing",
+    "v8-inspector",
+    "cdp",
+    "devtools",
+    "ai-agent",
+    "gemini",
+    "batch-processing",
+    "error-recovery",
+    "debugger"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "license": "MIT"
+}
