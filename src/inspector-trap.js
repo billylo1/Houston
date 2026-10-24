@@ -19,8 +19,46 @@ if (!globalThis.__houston) {
     currentStep: null,
     currentItem: null,
     lastError: null,
+    maxAllowedRisk: 'low',
+    __mutationAuthorized: false,
     history: [],
   };
+}
+
+/**
+ * Wraps an object in a recursive V8 Proxy that prevents any property mutation or deletion
+ * unless `globalThis.__houston.__mutationAuthorized === true` (unlocked only by risk-approved
+ * `mutateRuntime` calls).
+ */
+export function createRiskGuardedProxy(target) {
+  if (target === null || typeof target !== 'object') {
+    return target;
+  }
+  return new Proxy(target, {
+    get(obj, prop, receiver) {
+      const value = Reflect.get(obj, prop, receiver);
+      if (value !== null && typeof value === 'object') {
+        return createRiskGuardedProxy(value);
+      }
+      return value;
+    },
+    set(obj, prop, value, receiver) {
+      if (!globalThis.__houston.__mutationAuthorized) {
+        throw new Error(
+          `[Houston Risk Guard] Mutation of "${String(prop)}" prevented: mutations must be executed via mutateRuntime() with an assessed riskLevel <= "${globalThis.__houston.maxAllowedRisk}".`,
+        );
+      }
+      return Reflect.set(obj, prop, value, receiver);
+    },
+    deleteProperty(obj, prop) {
+      if (!globalThis.__houston.__mutationAuthorized) {
+        throw new Error(
+          `[Houston Risk Guard] Deletion of "${String(prop)}" prevented: mutations must be executed via mutateRuntime() with an assessed riskLevel <= "${globalThis.__houston.maxAllowedRisk}".`,
+        );
+      }
+      return Reflect.deleteProperty(obj, prop);
+    },
+  });
 }
 
 let inspectorOpened = false;
@@ -226,16 +264,19 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
     silent = false,
   } = options;
 
-  // Bind state into globalThis.__houston so live CDP expressions can inspect/mutate it
+  // Bind state into globalThis.__houston so live CDP expressions can inspect it,
+  // while wrapping `currentItem` in a RiskGuardedProxy to prevent unauthorized mutations.
   Object.assign(globalThis.__houston.context, context);
   globalThis.__houston.currentStep = stepId;
-  globalThis.__houston.currentItem = item;
+  globalThis.__houston.maxAllowedRisk = maxAllowedRisk;
+  globalThis.__houston.__mutationAuthorized = false;
+  globalThis.__houston.currentItem = createRiskGuardedProxy(item);
 
   let attempts = 0;
 
   while (attempts <= maxRetries) {
     try {
-      const result = await fn(globalThis.__houston.currentItem, globalThis.__houston.context);
+      const result = await fn(item, globalThis.__houston.context);
       return result;
     } catch (error) {
       attempts++;
@@ -248,9 +289,7 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
         throw error;
       }
 
-      const originalSnapshot = globalThis.__houston.currentItem !== null
-        ? structuredClone(globalThis.__houston.currentItem)
-        : null;
+      const originalSnapshot = item !== null ? structuredClone(item) : null;
 
       const inspectorUrl = ensureInspector(port, inspectorUrlFile);
       clearFile(actionFile);
@@ -304,21 +343,11 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
       const assessedRisk = (resolution.riskLevel || 'low').toLowerCase();
       const riskJustification = resolution.riskJustification || null;
 
-      // Enforce Risk Guardrail: block any healing mutation whose assessed risk exceeds maxAllowedRisk
+      // Enforce Risk Guardrail: block any healing action whose assessed risk exceeds maxAllowedRisk
       if (
         (resolution.action === 'retry' || resolution.action === 'blocked') &&
         !isRiskAllowed(assessedRisk, maxAllowedRisk)
       ) {
-        // Roll back any in-memory mutations made to globalThis.__houston.currentItem
-        if (originalSnapshot !== null && globalThis.__houston.currentItem && typeof globalThis.__houston.currentItem === 'object') {
-          for (const k of Object.keys(globalThis.__houston.currentItem)) {
-            delete globalThis.__houston.currentItem[k];
-          }
-          Object.assign(globalThis.__houston.currentItem, structuredClone(originalSnapshot));
-        } else {
-          globalThis.__houston.currentItem = originalSnapshot;
-        }
-
         const blockedReason =
           resolution.reason ||
           `Blocked ${assessedRisk}-risk healing action (maxAllowedRisk="${maxAllowedRisk}")`;
@@ -340,7 +369,7 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
 
         if (!silent) {
           console.warn(
-            `🛑 [Houston Risk Guard] Blocked ${assessedRisk.toUpperCase()}-risk action on "${stepId}" (maxAllowedRisk="${maxAllowedRisk}"): ${riskJustification || blockedReason}`,
+            `🛑 [Houston Risk Guard] Prevented ${assessedRisk.toUpperCase()}-risk action on "${stepId}" (maxAllowedRisk="${maxAllowedRisk}"): ${riskJustification || blockedReason}`,
           );
         }
 
@@ -360,7 +389,7 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
         originalValue: resolution.originalValue ?? originalSnapshot,
         fixedValue:
           resolution.action === 'retry'
-            ? (resolution.fixedValue ?? globalThis.__houston.currentItem)
+            ? (item !== null ? structuredClone(item) : resolution.fixedValue)
             : null,
         reason: resolution.reason || resolution.summary || `Resolved with ${resolution.action}`,
         filesPatched: resolution.filesPatched || [],

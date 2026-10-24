@@ -50,8 +50,8 @@ test('Houston traps failure, self-assesses low risk, mutates live variable over 
   assert.deepEqual(auditEntries[0].fixedValue, { id: 42, publishedAt: '2026-10-24' });
 });
 
-test('Houston blocks high-risk healing actions when maxAllowedRisk is low and rolls back any in-memory mutation', async () => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'houston-risk-block-'));
+test('Houston prevents high-risk mutations before execution and blocks direct writes via V8 Proxy', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'houston-risk-prevent-'));
   const auditLogPath = path.join(tmpDir, 'audit.jsonl');
   const incidentFile = path.join(tmpDir, 'incident.json');
   const actionFile = path.join(tmpDir, 'action.json');
@@ -61,16 +61,36 @@ test('Houston blocks high-risk healing actions when maxAllowedRisk is low and ro
     maxAllowedRisk: 'low',
     auditLogPath,
     silent: true,
-    onTrap: async ({ inspectorUrl }) => {
-      // Simulate an over-eager agent attempting to mutate a sensitive financial field over CDP
-      const cdp = await connectCDP(inspectorUrl);
-      await cdp.evalRuntime('globalThis.__houston.currentItem.royaltyFee = 0');
+    onTrap: async ({ inspectorUrl, maxAllowedRisk }) => {
+      const cdp = await connectCDP(inspectorUrl, { maxAllowedRisk });
+
+      // 1. Attempt a direct write during read-only inspection -> blocked by V8 Proxy
+      const directWriteAttempt = await cdp.inspectRuntime(
+        'globalThis.__houston.currentItem.royaltyFee = 0',
+      );
+      assert.match(directWriteAttempt.error, /Mutation of "royaltyFee" prevented/);
+
+      // 2. Attempt a high-risk mutation via mutateRuntime -> prevented BEFORE sending CDP command
+      const gatedAttempt = await cdp.mutateRuntime(
+        'globalThis.__houston.currentItem.royaltyFee = 0',
+        {
+          riskLevel: 'high',
+          riskJustification: 'Mutating financial royaltyFee alters monetary payout values',
+          maxAllowedRisk,
+        },
+      );
+      assert.equal(gatedAttempt.blocked, true);
+
+      // Verify V8 memory was never modified at any point
+      const liveValue = await cdp.inspectRuntime('globalThis.__houston.currentItem.royaltyFee');
+      assert.equal(liveValue, -450.0);
+
       await cdp.resumeAndClose();
       return {
-        action: 'retry',
+        action: 'blocked',
         riskLevel: 'high',
         riskJustification: 'Mutating financial royaltyFee alters monetary payout values',
-        reason: 'Attempted to zero out negative royaltyFee',
+        reason: 'Prevented high-risk mutation on royaltyFee',
       };
     },
   });
@@ -94,9 +114,7 @@ test('Houston blocks high-risk healing actions when maxAllowedRisk is low and ro
 
   houston.close();
 
-  // Step was blocked and skipped rather than retried
   assert.equal(outcome, null);
-  // In-memory item was rolled back to its original unmutated snapshot (-450.0, not 0)
   assert.equal(sensitiveItem.royaltyFee, -450.0);
 
   const audit = houston.getAuditHistory();
@@ -118,9 +136,13 @@ test('Houston allows medium/high risk actions when maxAllowedRisk is explicitly 
     maxAllowedRisk: 'medium',
     auditLogPath,
     silent: true,
-    onTrap: async ({ inspectorUrl }) => {
-      const cdp = await connectCDP(inspectorUrl);
-      await cdp.evalRuntime('globalThis.__houston.currentItem.category = "uncategorized"');
+    onTrap: async ({ inspectorUrl, maxAllowedRisk }) => {
+      const cdp = await connectCDP(inspectorUrl, { maxAllowedRisk });
+      await cdp.mutateRuntime('globalThis.__houston.currentItem.category = "uncategorized"', {
+        riskLevel: 'medium',
+        riskJustification: 'Defaulting optional non-financial category metadata',
+        maxAllowedRisk,
+      });
       await cdp.resumeAndClose();
       return {
         action: 'retry',

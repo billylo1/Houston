@@ -38,7 +38,7 @@ function writeAction(actionFile, payload) {
   fs.writeFileSync(actionFile, JSON.stringify(payload, null, 2), 'utf8');
 }
 
-export async function connectCDP(wsUrl) {
+export async function connectCDP(wsUrl, { maxAllowedRisk: defaultMaxRisk = 'low' } = {}) {
   if (!wsUrl) return null;
   try {
     const ws = new WebSocket(wsUrl);
@@ -75,20 +75,81 @@ export async function connectCDP(wsUrl) {
     });
 
     await send('Debugger.enable');
+
+    /**
+     * Read-only evaluation: `globalThis.__houston.__mutationAuthorized` remains false,
+     * so the V8 Proxy on `currentItem` rejects any attempted property write.
+     */
+    const inspectRuntime = async (expression) => {
+      const wrappedInspect = `(() => {
+        const __val = (${expression});
+        if (__val !== null && typeof __val === 'object') {
+          try { return JSON.parse(JSON.stringify(__val)); } catch { return __val; }
+        }
+        return __val;
+      })()`;
+      const res = await send('Runtime.evaluate', {
+        expression: wrappedInspect,
+        returnByValue: true,
+        awaitPromise: true,
+      });
+      if (res?.exceptionDetails) {
+        return { error: res.result?.description || res.exceptionDetails.text };
+      }
+      return res?.result?.value !== undefined ? res.result.value : res?.result;
+    };
+
+    /**
+     * Pre-execution risk-gated mutation:
+     * 1. Verifies `isRiskAllowed(riskLevel, maxAllowedRisk)` BEFORE sending any CDP message.
+     * 2. If allowed, unlocks `globalThis.__houston.__mutationAuthorized` only for the duration of the expression.
+     */
+    const mutateRuntime = async (
+      expression,
+      { riskLevel, riskJustification = '', maxAllowedRisk = defaultMaxRisk } = {},
+    ) => {
+      if (!riskLevel) {
+        return {
+          blocked: true,
+          error: 'Risk Guardrail Prevented Mutation: riskLevel ("low" | "medium" | "high") is required before mutating V8 state.',
+        };
+      }
+      if (!isRiskAllowed(riskLevel, maxAllowedRisk)) {
+        return {
+          blocked: true,
+          riskLevel,
+          maxAllowedRisk,
+          riskJustification,
+          error: `Risk Guardrail Prevented Mutation: assessed risk "${riskLevel}" exceeds maxAllowedRisk="${maxAllowedRisk}". V8 memory was NOT modified.`,
+        };
+      }
+
+      const wrappedExpression = `(() => {
+        globalThis.__houston.__mutationAuthorized = true;
+        try {
+          return (${expression});
+        } finally {
+          globalThis.__houston.__mutationAuthorized = false;
+        }
+      })()`;
+
+      const res = await send('Runtime.evaluate', {
+        expression: wrappedExpression,
+        returnByValue: true,
+        awaitPromise: true,
+      });
+      if (res?.exceptionDetails) {
+        return { error: res.result?.description || res.exceptionDetails.text };
+      }
+      return res?.result?.value !== undefined ? res.result.value : res?.result;
+    };
+
     return {
       ws,
       send,
-      async evalRuntime(expression) {
-        const res = await send('Runtime.evaluate', {
-          expression,
-          returnByValue: true,
-          awaitPromise: true,
-        });
-        if (res?.exceptionDetails) {
-          return { error: res.result?.description || res.exceptionDetails.text };
-        }
-        return res?.result?.value !== undefined ? res.result.value : res?.result;
-      },
+      inspectRuntime,
+      mutateRuntime,
+      evalRuntime: inspectRuntime,
       async resumeAndClose() {
         try {
           await send('Debugger.resume');
@@ -112,18 +173,43 @@ const GEMINI_TOOLS = [
   {
     functionDeclarations: [
       {
-        name: 'eval_runtime',
+        name: 'inspect_runtime',
         description:
-          'Evaluate a JavaScript expression in the live V8 runtime. Inspect or mutate `globalThis.__houston.currentItem` or `globalThis.__houston.context`.',
+          'Read-only inspection of a JavaScript expression in the live V8 runtime (e.g. `globalThis.__houston.currentItem` or `globalThis.__houston.context`). Direct mutations are blocked by a V8 Proxy during inspection.',
         parameters: {
           type: 'OBJECT',
           properties: {
             expression: {
               type: 'STRING',
-              description: 'JavaScript expression to evaluate in the paused Node.js process',
+              description: 'Read-only JavaScript expression to evaluate in the paused Node.js process',
             },
           },
           required: ['expression'],
+        },
+      },
+      {
+        name: 'mutate_runtime',
+        description:
+          'Mutate `globalThis.__houston.currentItem` or `globalThis.__houston.context` in the live V8 runtime. Requires self-assessing `riskLevel` and `riskJustification` BEFORE execution. If `riskLevel` exceeds `maxAllowedRisk`, the mutation is prevented from executing.',
+        parameters: {
+          type: 'OBJECT',
+          properties: {
+            expression: {
+              type: 'STRING',
+              description: 'JavaScript mutation expression (e.g. `globalThis.__houston.currentItem.publishedAt = "2026-10-24"`)',
+            },
+            riskLevel: {
+              type: 'STRING',
+              enum: ['low', 'medium', 'high'],
+              description:
+                'Self-assessed risk level of this mutation: "low" (formatting, date normalization, whitespace trimming), "medium" (defaulting optional metadata), or "high" (financial amounts, prices, balances, quantities, auth/permissions)',
+            },
+            riskJustification: {
+              type: 'STRING',
+              description: 'Why this mutation carries this risk level',
+            },
+          },
+          required: ['expression', 'riskLevel', 'riskJustification'],
         },
       },
       {
@@ -210,17 +296,18 @@ async function runGeminiLoop({ incident, cdp, model, maxAllowedRisk = 'low', act
   const systemPrompt = [
     'You are Houston ("Houston, we have a problem... Investigate it live and fix it for me!"), an autonomous V8 runtime debugger for Node.js.',
     'A batch step just threw an error and is paused.',
-    'The current item being processed is stored at `globalThis.__houston.currentItem` and shared context at `globalThis.__houston.context`.',
+    'The current item being processed is stored at `globalThis.__houston.currentItem` (guarded by a read-only V8 Proxy unless unlocked via `mutate_runtime`) and shared context at `globalThis.__houston.context`.',
     '',
-    'CRITICAL RISK SELF-ASSESSMENT POLICY:',
+    'CRITICAL PRE-EXECUTION RISK POLICY:',
     `The maximum allowed risk level for automatic execution is "${maxAllowedRisk.toUpperCase()}".`,
-    'Before mutating any state or code, you MUST self-assess the risk level ("low", "medium", or "high"):',
-    '- "low": Safe, non-destructive formatting fixes (e.g., converting DD/MM/YYYY date strings to ISO-8601 YYYY-MM-DD, trimming whitespace, normalizing case).',
-    '- "medium": Filling in missing optional non-financial metadata or updating a non-destructive CSS/DOM selector.',
-    '- "high": Modifying financial amounts, prices, royalty fees, account balances, inventory quantities, user/account IDs, permissions, or bypassing security/business validation rules.',
-    '',
-    `If the required fix has a risk level higher than "${maxAllowedRisk}", DO NOT mutate \`globalThis.__houston.currentItem\` or patch files! Instead, immediately call \`complete_healing\` with action="blocked", the assessed \`riskLevel\`, \`riskJustification\`, and \`reason\`.`,
-    `If the fix is within the "${maxAllowedRisk}" threshold, apply the fix via \`eval_runtime\` (or \`patch_code_file\`) and call \`complete_healing\` with action="retry", \`riskLevel\`, \`riskJustification\`, and \`reason\`.`,
+    '1. Use `inspect_runtime` for read-only inspection of `globalThis.__houston.currentItem` and `read_code_file` to inspect source files.',
+    '2. To mutate live memory or patch code, you MUST self-assess `riskLevel` ("low", "medium", or "high") and `riskJustification`:',
+    '   - "low": Safe, non-destructive formatting fixes (e.g., converting DD/MM/YYYY date strings to ISO-8601 YYYY-MM-DD, trimming whitespace, normalizing case).',
+    '   - "medium": Filling in missing optional non-financial metadata or updating a non-destructive CSS/DOM selector.',
+    '   - "high": Modifying financial amounts, prices, royalty fees, account balances, inventory quantities, user/account IDs, permissions, or bypassing security/business validation rules.',
+    `3. Call \`mutate_runtime\` with your assessed \`riskLevel\`. Note: \`mutate_runtime\` enforces the risk guardrail BEFORE touching V8 memory—if \`riskLevel\` exceeds "${maxAllowedRisk}", the mutation will be prevented automatically.`,
+    `4. If a required fix exceeds "${maxAllowedRisk}", call \`complete_healing\` with action="blocked", the assessed \`riskLevel\`, \`riskJustification\`, and \`reason\`.`,
+    `5. If the fix succeeded within "${maxAllowedRisk}", call \`complete_healing\` with action="retry", \`riskLevel\`, \`riskJustification\`, and \`reason\`.`,
   ].join('\n');
 
   const userPrompt = [
@@ -259,7 +346,7 @@ async function runGeminiLoop({ incident, cdp, model, maxAllowedRisk = 'low', act
     console.log(`  ↳ [Houston Tool] ${name}(${JSON.stringify(args)})`);
 
     if (name === 'complete_healing') {
-      const updatedItem = cdp ? await cdp.evalRuntime('globalThis.__houston.currentItem') : null;
+      const updatedItem = cdp ? await cdp.inspectRuntime('globalThis.__houston.currentItem') : null;
       writeAction(actionFile, {
         action: args.action,
         riskLevel: args.riskLevel || 'low',
@@ -274,8 +361,16 @@ async function runGeminiLoop({ incident, cdp, model, maxAllowedRisk = 'low', act
     }
 
     let output = {};
-    if (name === 'eval_runtime') {
-      output = cdp ? await cdp.evalRuntime(args.expression) : { error: 'No CDP connection' };
+    if (name === 'inspect_runtime') {
+      output = cdp ? await cdp.inspectRuntime(args.expression) : { error: 'No CDP connection' };
+    } else if (name === 'mutate_runtime') {
+      output = cdp
+        ? await cdp.mutateRuntime(args.expression, {
+            riskLevel: args.riskLevel,
+            riskJustification: args.riskJustification,
+            maxAllowedRisk,
+          })
+        : { error: 'No CDP connection' };
     } else if (name === 'read_code_file') {
       const target = path.resolve(args.filePath);
       output = fs.existsSync(target)
@@ -284,7 +379,8 @@ async function runGeminiLoop({ incident, cdp, model, maxAllowedRisk = 'low', act
     } else if (name === 'patch_code_file') {
       if (!isRiskAllowed(args.riskLevel || 'medium', maxAllowedRisk)) {
         output = {
-          error: `Risk Guardrail Blocked: patch assessed as "${args.riskLevel}" risk, which exceeds maxAllowedRisk="${maxAllowedRisk}".`,
+          blocked: true,
+          error: `Risk Guardrail Prevented Patch: assessed risk "${args.riskLevel}" exceeds maxAllowedRisk="${maxAllowedRisk}". File was NOT modified.`,
         };
       } else {
         const target = path.resolve(args.filePath);
@@ -325,7 +421,7 @@ async function runBuiltInLiveHealer({ incident, cdp, maxAllowedRisk = 'low', act
     `🛰️  [Houston Live Healer] Inspecting V8 runtime memory via CDP (maxAllowedRisk="${maxAllowedRisk}")...`,
   );
 
-  const currentItem = await cdp.evalRuntime('globalThis.__houston.currentItem');
+  const currentItem = await cdp.inspectRuntime('globalThis.__houston.currentItem');
   if (!currentItem || typeof currentItem !== 'object') {
     return false;
   }
@@ -348,12 +444,18 @@ async function runBuiltInLiveHealer({ incident, cdp, maxAllowedRisk = 'low', act
         `⚖️  [Houston Risk Assessment] Assessed RISK=${assessedRisk.toUpperCase()} for "${key}": ${riskJustification}`,
       );
 
-      if (!isRiskAllowed(assessedRisk, maxAllowedRisk)) {
+      const safeNumeric = typeof val === 'number' && !Number.isNaN(val) ? Math.abs(val) : 0;
+      const mutationResult = await cdp.mutateRuntime(
+        `globalThis.__houston.currentItem[${JSON.stringify(key)}] = ${JSON.stringify(safeNumeric)}`,
+        { riskLevel: assessedRisk, riskJustification, maxAllowedRisk },
+      );
+
+      if (mutationResult?.blocked) {
         writeAction(actionFile, {
           action: 'blocked',
           riskLevel: assessedRisk,
           riskJustification,
-          reason: `Refused to auto-mutate sensitive field "${key}" (${JSON.stringify(val)}) under maxAllowedRisk="${maxAllowedRisk}"`,
+          reason: `Prevented mutation of sensitive field "${key}" (${JSON.stringify(val)}) under maxAllowedRisk="${maxAllowedRisk}"`,
           originalValue: incident.currentItemPreview,
           fixedValue: null,
         });
@@ -361,12 +463,7 @@ async function runBuiltInLiveHealer({ incident, cdp, maxAllowedRisk = 'low', act
         return true;
       }
 
-      // Only reached if user explicitly configured maxAllowedRisk: 'high'
-      const safeNumeric = typeof val === 'number' && !Number.isNaN(val) ? Math.abs(val) : 0;
-      await cdp.evalRuntime(
-        `globalThis.__houston.currentItem[${JSON.stringify(key)}] = ${JSON.stringify(safeNumeric)}`,
-      );
-      const updatedItem = await cdp.evalRuntime('globalThis.__houston.currentItem');
+      const updatedItem = await cdp.inspectRuntime('globalThis.__houston.currentItem');
       writeAction(actionFile, {
         action: 'retry',
         riskLevel: assessedRisk,
@@ -391,22 +488,24 @@ async function runBuiltInLiveHealer({ incident, cdp, maxAllowedRisk = 'low', act
     if (typeof val === 'string' && /^\d{2}\/\d{2}\/\d{4}$/.test(val.trim())) {
       const [dd, mm, yyyy] = val.trim().split('/');
       const iso = `${yyyy}-${mm}-${dd}`;
-      if (isRiskAllowed(assessedRisk, maxAllowedRisk)) {
-        await cdp.evalRuntime(
-          `globalThis.__houston.currentItem[${JSON.stringify(key)}] = ${JSON.stringify(iso)}`,
-        );
+      const res = await cdp.mutateRuntime(
+        `globalThis.__houston.currentItem[${JSON.stringify(key)}] = ${JSON.stringify(iso)}`,
+        { riskLevel: assessedRisk, riskJustification, maxAllowedRisk },
+      );
+      if (!res?.blocked) {
+        fixed = true;
+        reasons.push(`Normalized ${key} from DD/MM/YYYY ("${val}") to ISO-8601 ("${iso}")`);
       }
-      fixed = true;
-      reasons.push(`Normalized ${key} from DD/MM/YYYY ("${val}") to ISO-8601 ("${iso}")`);
     } else if (typeof val === 'string' && val !== val.trim()) {
       const trimmed = val.trim();
-      if (isRiskAllowed(assessedRisk, maxAllowedRisk)) {
-        await cdp.evalRuntime(
-          `globalThis.__houston.currentItem[${JSON.stringify(key)}] = ${JSON.stringify(trimmed)}`,
-        );
+      const res = await cdp.mutateRuntime(
+        `globalThis.__houston.currentItem[${JSON.stringify(key)}] = ${JSON.stringify(trimmed)}`,
+        { riskLevel: assessedRisk, riskJustification, maxAllowedRisk },
+      );
+      if (!res?.blocked) {
+        fixed = true;
+        reasons.push(`Trimmed extraneous whitespace on ${key}`);
       }
-      fixed = true;
-      reasons.push(`Trimmed extraneous whitespace on ${key}`);
     }
   }
 
@@ -414,7 +513,7 @@ async function runBuiltInLiveHealer({ incident, cdp, maxAllowedRisk = 'low', act
     console.log(
       `⚖️  [Houston Risk Assessment] Assessed RISK=${assessedRisk.toUpperCase()}: ${riskJustification}`,
     );
-    const updatedItem = await cdp.evalRuntime('globalThis.__houston.currentItem');
+    const updatedItem = await cdp.inspectRuntime('globalThis.__houston.currentItem');
     const reason = reasons.join('; ');
     console.log(`✅ [Houston Live Healer] Fixed in V8 memory: ${reason}`);
     writeAction(actionFile, {
