@@ -281,14 +281,27 @@ const GEMINI_TOOLS = [
   },
 ];
 
-async function runGeminiLoop({ incident, cdp, model, maxAllowedRisk = 'low', allowCodePatches = false, actionFile }) {
+async function runGeminiLoop({
+  incident,
+  cdp,
+  model = 'gemini-4-argon',
+  thinkingLevel = 'high',
+  maxAllowedRisk = 'low',
+  allowCodePatches = false,
+  actionFile,
+}) {
   const apiKey = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
   if (!apiKey) {
     return false;
   }
 
+  const normalizedThinkingLevel =
+    String(thinkingLevel || 'high').toLowerCase() === 'max'
+      ? 'high'
+      : String(thinkingLevel || 'high').toLowerCase();
+
   console.log(
-    `🛰️  [Houston AI] Investigating "${incident.stepId}" live with ${model} (maxAllowedRisk="${maxAllowedRisk}")...`,
+    `🛰️  [Houston AI] Investigating "${incident.stepId}" live with ${model} (thinking="${normalizedThinkingLevel}", maxAllowedRisk="${maxAllowedRisk}")...`,
   );
   const filesPatched = [];
   const relevantFiles = incident.relevantFiles || [];
@@ -329,7 +342,15 @@ async function runGeminiLoop({ incident, cdp, model, maxAllowedRisk = 'low', all
         'Content-Type': 'application/json',
         'x-goog-api-key': apiKey,
       },
-      body: JSON.stringify({ contents, tools: GEMINI_TOOLS }),
+      body: JSON.stringify({
+        contents,
+        tools: GEMINI_TOOLS,
+        generationConfig: {
+          thinkingConfig: {
+            thinkingLevel: normalizedThinkingLevel,
+          },
+        },
+      }),
     });
 
     if (!res.ok) {
@@ -558,7 +579,8 @@ export async function main(rawArgs = process.argv.slice(2)) {
       incident: { type: 'string', default: DEFAULT_INCIDENT_FILE },
       'action-file': { type: 'string', default: DEFAULT_ACTION_FILE },
       'audit-log': { type: 'string' },
-      model: { type: 'string', default: 'gemini-3.8-flash' },
+      model: { type: 'string', default: 'gemini-4-argon' },
+      'thinking-level': { type: 'string', default: 'high' },
       'max-risk': { type: 'string', default: 'low' },
       'allow-code-patches': { type: 'boolean', default: false },
       auto: { type: 'boolean', default: false },
@@ -627,6 +649,7 @@ export async function main(rawArgs = process.argv.slice(2)) {
       incident,
       cdp,
       model: flags.model,
+      thinkingLevel: flags['thinking-level'],
       maxAllowedRisk,
       allowCodePatches,
       actionFile,

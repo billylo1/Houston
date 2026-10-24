@@ -12,7 +12,8 @@ export class Houston {
   constructor(config = {}) {
     this.config = {
       mode: config.mode || process.env.HOUSTON_MODE || 'auto',
-      model: config.model || process.env.HOUSTON_MODEL || 'gemini-3.8-flash',
+      model: config.model || process.env.HOUSTON_MODEL || 'gemini-4-argon',
+      thinkingLevel: config.thinkingLevel || process.env.HOUSTON_THINKING_LEVEL || 'high',
       maxAllowedRisk: config.maxAllowedRisk || process.env.HOUSTON_MAX_RISK || 'low',
       onRiskExceeded: config.onRiskExceeded || 'skip', // 'skip' | 'throw'
       allowCodePatches: config.allowCodePatches ?? false,

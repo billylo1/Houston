@@ -204,7 +204,8 @@ export function printHoustonBanner({ stepId, error, inspectorUrl, incidentFile, 
 
 export async function spawnAgentRunner({
   mode,
-  model,
+  model = 'gemini-4-argon',
+  thinkingLevel = 'high',
   maxAllowedRisk = 'low',
   allowCodePatches = false,
   incidentFile,
@@ -221,6 +222,7 @@ export async function spawnAgentRunner({
     '--action-file', actionFile,
     '--audit-log', auditLogPath,
     '--model', model,
+    '--thinking-level', thinkingLevel,
     '--max-risk', maxAllowedRisk,
   ];
 
@@ -274,7 +276,8 @@ export async function waitForResolution({
 export async function executeWithHoustonTrap(stepId, fn, options = {}) {
   const {
     mode = 'auto',
-    model = 'gemini-3.8-flash',
+    model = 'gemini-4-argon',
+    thinkingLevel = 'high',
     maxAllowedRisk = 'low',
     onRiskExceeded = 'skip',
     allowCodePatches = false,
@@ -358,6 +361,7 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
         await spawnAgentRunner({
           mode,
           model,
+          thinkingLevel,
           maxAllowedRisk,
           allowCodePatches,
           incidentFile,

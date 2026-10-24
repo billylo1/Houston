@@ -38,7 +38,8 @@ import { Houston } from 'houston-js';
 
 const houston = new Houston({
   mode: 'auto', // 'auto' | 'interactive' | 'off'
-  model: 'gemini-3.8-flash',
+  model: 'gemini-4-argon', // Gemini 4 Argon by default
+  thinkingLevel: 'high', // Max reasoning depth ('high' / 'max' | 'medium' | 'low')
   maxAllowedRisk: 'low', // 'low' (default) | 'medium' | 'high'
   onRiskExceeded: 'skip', // 'skip' (default) | 'throw'
   allowCodePatches: false, // opt-in disk patching on `relevantFiles`
