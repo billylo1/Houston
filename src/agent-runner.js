@@ -3,27 +3,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { DEFAULT_INCIDENT_FILE, DEFAULT_ACTION_FILE } from './inspector-trap.js';
 import { isRiskAllowed } from './audit-logger.js';
-
-const { values: flags } = parseArgs({
-  options: {
-    incident: { type: 'string', default: DEFAULT_INCIDENT_FILE },
-    'action-file': { type: 'string', default: DEFAULT_ACTION_FILE },
-    'audit-log': { type: 'string' },
-    model: { type: 'string', default: 'gemini-3.8-flash' },
-    'max-risk': { type: 'string', default: 'low' },
-    auto: { type: 'boolean', default: false },
-    retry: { type: 'boolean', default: false },
-    skip: { type: 'boolean', default: false },
-    status: { type: 'boolean', default: false },
-    eval: { type: 'string' },
-    reason: { type: 'string' },
-    risk: { type: 'string' },
-  },
-  strict: false,
-});
 
 function loadIncident(filePath) {
   if (!fs.existsSync(filePath)) return null;
@@ -35,7 +18,29 @@ function loadIncident(filePath) {
 }
 
 function writeAction(actionFile, payload) {
-  fs.writeFileSync(actionFile, JSON.stringify(payload, null, 2), 'utf8');
+  fs.writeFileSync(actionFile, JSON.stringify(payload, null, 2), { encoding: 'utf8', mode: 0o600 });
+}
+
+/**
+ * Verify that `targetPath` is inside the `relevantFiles` allowlist.
+ */
+export function isFileAllowed(targetPath, relevantFiles = []) {
+  if (!targetPath || !Array.isArray(relevantFiles) || relevantFiles.length === 0) {
+    return false;
+  }
+  let resolvedTarget;
+  try {
+    resolvedTarget = fs.realpathSync(path.resolve(targetPath));
+  } catch {
+    resolvedTarget = path.resolve(targetPath);
+  }
+  return relevantFiles.some((allowed) => {
+    try {
+      return fs.realpathSync(path.resolve(allowed)) === resolvedTarget;
+    } catch {
+      return path.resolve(allowed) === resolvedTarget;
+    }
+  });
 }
 
 export async function connectCDP(wsUrl, { maxAllowedRisk: defaultMaxRisk = 'low' } = {}) {
@@ -106,14 +111,8 @@ export async function connectCDP(wsUrl, { maxAllowedRisk: defaultMaxRisk = 'low'
      */
     const mutateRuntime = async (
       expression,
-      { riskLevel, riskJustification = '', maxAllowedRisk = defaultMaxRisk } = {},
+      { riskLevel = 'high', riskJustification = '', maxAllowedRisk = defaultMaxRisk } = {},
     ) => {
-      if (!riskLevel) {
-        return {
-          blocked: true,
-          error: 'Risk Guardrail Prevented Mutation: riskLevel ("low" | "medium" | "high") is required before mutating V8 state.',
-        };
-      }
       if (!isRiskAllowed(riskLevel, maxAllowedRisk)) {
         return {
           blocked: true,
@@ -214,11 +213,11 @@ const GEMINI_TOOLS = [
       },
       {
         name: 'read_code_file',
-        description: 'Read a source code file on disk to understand validation or scraper logic.',
+        description: 'Read an allowlisted source code file from `relevantFiles` on disk.',
         parameters: {
           type: 'OBJECT',
           properties: {
-            filePath: { type: 'STRING', description: 'Path to the file' },
+            filePath: { type: 'STRING', description: 'Path to the file (must be in `relevantFiles`)' },
           },
           required: ['filePath'],
         },
@@ -226,11 +225,11 @@ const GEMINI_TOOLS = [
       {
         name: 'patch_code_file',
         description:
-          'Patch a source code file on disk by replacing an exact string. Requires self-assessing the risk level first.',
+          'Patch an allowlisted source code file on disk by replacing an exact string. Requires `allowCodePatches: true` and self-assessing the risk level first.',
         parameters: {
           type: 'OBJECT',
           properties: {
-            filePath: { type: 'STRING', description: 'Path to the file' },
+            filePath: { type: 'STRING', description: 'Path to the file (must be in `relevantFiles`)' },
             search: { type: 'STRING', description: 'Exact string to search for' },
             replace: { type: 'STRING', description: 'Replacement string' },
             riskLevel: {
@@ -282,7 +281,7 @@ const GEMINI_TOOLS = [
   },
 ];
 
-async function runGeminiLoop({ incident, cdp, model, maxAllowedRisk = 'low', actionFile }) {
+async function runGeminiLoop({ incident, cdp, model, maxAllowedRisk = 'low', allowCodePatches = false, actionFile }) {
   const apiKey = process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY;
   if (!apiKey) {
     return false;
@@ -292,15 +291,16 @@ async function runGeminiLoop({ incident, cdp, model, maxAllowedRisk = 'low', act
     `🛰️  [Houston AI] Investigating "${incident.stepId}" live with ${model} (maxAllowedRisk="${maxAllowedRisk}")...`,
   );
   const filesPatched = [];
+  const relevantFiles = incident.relevantFiles || [];
 
   const systemPrompt = [
     'You are Houston ("Houston, we have a problem... Investigate it live and fix it for me!"), an autonomous V8 runtime debugger for Node.js.',
     'A batch step just threw an error and is paused.',
-    'The current item being processed is stored at `globalThis.__houston.currentItem` (guarded by a read-only V8 Proxy unless unlocked via `mutate_runtime`) and shared context at `globalThis.__houston.context`.',
+    'The current item being processed is stored at `globalThis.__houston.currentItem` (guarded by a V8 Proxy during inspection) and shared context at `globalThis.__houston.context`.',
     '',
     'CRITICAL PRE-EXECUTION RISK POLICY:',
     `The maximum allowed risk level for automatic execution is "${maxAllowedRisk.toUpperCase()}".`,
-    '1. Use `inspect_runtime` for read-only inspection of `globalThis.__houston.currentItem` and `read_code_file` to inspect source files.',
+    '1. Use `inspect_runtime` for read-only inspection of `globalThis.__houston.currentItem` and `read_code_file` to inspect allowlisted `relevantFiles`.',
     '2. To mutate live memory or patch code, you MUST self-assess `riskLevel` ("low", "medium", or "high") and `riskJustification`:',
     '   - "low": Safe, non-destructive formatting fixes (e.g., converting DD/MM/YYYY date strings to ISO-8601 YYYY-MM-DD, trimming whitespace, normalizing case).',
     '   - "medium": Filling in missing optional non-financial metadata or updating a non-destructive CSS/DOM selector.',
@@ -316,16 +316,19 @@ async function runGeminiLoop({ incident, cdp, model, maxAllowedRisk = 'low', act
     `Error: ${incident.error?.message}`,
     `Stack:\n${incident.error?.stack}`,
     `Current Item Preview: ${JSON.stringify(incident.currentItemPreview)}`,
-    `Relevant Files: ${JSON.stringify(incident.relevantFiles)}`,
+    `Relevant Files (Allowlist): ${JSON.stringify(relevantFiles)}`,
   ].join('\n\n');
 
   const contents = [{ role: 'user', parts: [{ text: `${systemPrompt}\n\n${userPrompt}` }] }];
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
   for (let turn = 1; turn <= 8; turn++) {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+      },
       body: JSON.stringify({ contents, tools: GEMINI_TOOLS }),
     });
 
@@ -349,7 +352,7 @@ async function runGeminiLoop({ incident, cdp, model, maxAllowedRisk = 'low', act
       const updatedItem = cdp ? await cdp.inspectRuntime('globalThis.__houston.currentItem') : null;
       writeAction(actionFile, {
         action: args.action,
-        riskLevel: args.riskLevel || 'low',
+        riskLevel: args.riskLevel || 'high',
         riskJustification: args.riskJustification || null,
         reason: args.reason,
         originalValue: incident.currentItemPreview,
@@ -366,21 +369,37 @@ async function runGeminiLoop({ incident, cdp, model, maxAllowedRisk = 'low', act
     } else if (name === 'mutate_runtime') {
       output = cdp
         ? await cdp.mutateRuntime(args.expression, {
-            riskLevel: args.riskLevel,
+            riskLevel: args.riskLevel || 'high',
             riskJustification: args.riskJustification,
             maxAllowedRisk,
           })
         : { error: 'No CDP connection' };
     } else if (name === 'read_code_file') {
-      const target = path.resolve(args.filePath);
-      output = fs.existsSync(target)
-        ? { content: fs.readFileSync(target, 'utf8') }
-        : { error: `File not found: ${args.filePath}` };
+      if (!isFileAllowed(args.filePath, relevantFiles)) {
+        output = {
+          error: `File Access Denied: "${args.filePath}" is not in the step's relevantFiles allowlist.`,
+        };
+      } else {
+        const target = path.resolve(args.filePath);
+        output = fs.existsSync(target)
+          ? { content: fs.readFileSync(target, 'utf8') }
+          : { error: `File not found: ${args.filePath}` };
+      }
     } else if (name === 'patch_code_file') {
-      if (!isRiskAllowed(args.riskLevel || 'medium', maxAllowedRisk)) {
+      if (!allowCodePatches && !incident.allowCodePatches) {
         output = {
           blocked: true,
-          error: `Risk Guardrail Prevented Patch: assessed risk "${args.riskLevel}" exceeds maxAllowedRisk="${maxAllowedRisk}". File was NOT modified.`,
+          error: 'Code Patching Disabled: set `allowCodePatches: true` in Houston config to permit file modifications.',
+        };
+      } else if (!isFileAllowed(args.filePath, relevantFiles)) {
+        output = {
+          blocked: true,
+          error: `File Access Denied: "${args.filePath}" is not in the step's relevantFiles allowlist.`,
+        };
+      } else if (!isRiskAllowed(args.riskLevel || 'high', maxAllowedRisk)) {
+        output = {
+          blocked: true,
+          error: `Risk Guardrail Prevented Patch: assessed risk "${args.riskLevel || 'high'}" exceeds maxAllowedRisk="${maxAllowedRisk}". File was NOT modified.`,
         };
       } else {
         const target = path.resolve(args.filePath);
@@ -408,7 +427,8 @@ async function runGeminiLoop({ incident, cdp, model, maxAllowedRisk = 'low', act
   return false;
 }
 
-const HIGH_RISK_KEY_PATTERN = /(price|amount|balance|royalty|fee|cost|total|salary|payout|usd|cents|quantity|role|permission|auth)/i;
+const HIGH_RISK_KEY_PATTERN =
+  /(price|amount|balance|royalty|fee|cost|total|salary|payout|usd|cents|quantity|role|permission|auth)/i;
 
 /**
  * Built-in live heuristic healer when running offline or without an LLM API key.
@@ -531,34 +551,54 @@ async function runBuiltInLiveHealer({ incident, cdp, maxAllowedRisk = 'low', act
   return false;
 }
 
-async function main() {
+export async function main(rawArgs = process.argv.slice(2)) {
+  const { values: flags } = parseArgs({
+    args: rawArgs,
+    options: {
+      incident: { type: 'string', default: DEFAULT_INCIDENT_FILE },
+      'action-file': { type: 'string', default: DEFAULT_ACTION_FILE },
+      'audit-log': { type: 'string' },
+      model: { type: 'string', default: 'gemini-3.8-flash' },
+      'max-risk': { type: 'string', default: 'low' },
+      'allow-code-patches': { type: 'boolean', default: false },
+      auto: { type: 'boolean', default: false },
+      retry: { type: 'boolean', default: false },
+      skip: { type: 'boolean', default: false },
+      status: { type: 'boolean', default: false },
+      eval: { type: 'string' },
+      reason: { type: 'string' },
+      risk: { type: 'string' },
+    },
+    strict: false,
+  });
+
   const incidentFile = flags.incident || DEFAULT_INCIDENT_FILE;
   const actionFile = flags['action-file'] || DEFAULT_ACTION_FILE;
   const incident = loadIncident(incidentFile);
 
   if (!incident) {
     console.log(`No active Houston incident found at ${incidentFile}`);
-    process.exit(0);
+    return;
   }
 
   if (flags.status) {
     console.log(JSON.stringify(incident, null, 2));
-    process.exit(0);
-  }
-
-  const cdp = await connectCDP(incident.inspectorUrl);
-
-  if (flags.eval && cdp) {
-    const val = await cdp.evalRuntime(flags.eval);
-    console.log(JSON.stringify(val, null, 2));
-    await cdp.resumeAndClose();
-    process.exit(0);
+    return;
   }
 
   const maxAllowedRisk = flags['max-risk'] || incident.maxAllowedRisk || 'low';
+  const allowCodePatches = Boolean(flags['allow-code-patches'] || incident.allowCodePatches);
+  const cdp = await connectCDP(incident.inspectorUrl, { maxAllowedRisk });
+
+  if (flags.eval && cdp) {
+    const val = await cdp.inspectRuntime(flags.eval);
+    console.log(JSON.stringify(val, null, 2));
+    await cdp.resumeAndClose();
+    return;
+  }
 
   if (flags.retry) {
-    const updatedItem = cdp ? await cdp.evalRuntime('globalThis.__houston.currentItem') : null;
+    const updatedItem = cdp ? await cdp.inspectRuntime('globalThis.__houston.currentItem') : null;
     writeAction(actionFile, {
       action: 'retry',
       riskLevel: flags.risk || 'low',
@@ -568,7 +608,7 @@ async function main() {
       fixedValue: updatedItem,
     });
     await cdp?.resumeAndClose();
-    process.exit(0);
+    return;
   }
 
   if (flags.skip) {
@@ -579,7 +619,7 @@ async function main() {
       reason: flags.reason || 'Manual CLI skip',
     });
     await cdp?.resumeAndClose();
-    process.exit(0);
+    return;
   }
 
   if (flags.auto) {
@@ -588,9 +628,10 @@ async function main() {
       cdp,
       model: flags.model,
       maxAllowedRisk,
+      allowCodePatches,
       actionFile,
     });
-    if (aiHealed) process.exit(0);
+    if (aiHealed) return;
 
     const heuristicHealed = await runBuiltInLiveHealer({
       incident,
@@ -598,7 +639,7 @@ async function main() {
       maxAllowedRisk,
       actionFile,
     });
-    if (heuristicHealed) process.exit(0);
+    if (heuristicHealed) return;
 
     writeAction(actionFile, {
       action: 'skip',
@@ -607,7 +648,7 @@ async function main() {
       reason: 'Autonomous healer could not repair item; skipping step.',
     });
     await cdp?.resumeAndClose();
-    process.exit(0);
+    return;
   }
 
   // Interactive REPL
@@ -618,7 +659,7 @@ async function main() {
       async (ans) => {
         const cmd = ans.trim().toLowerCase();
         if (cmd === 'r' || cmd === 'retry') {
-          const updatedItem = cdp ? await cdp.evalRuntime('globalThis.__houston.currentItem') : null;
+          const updatedItem = cdp ? await cdp.inspectRuntime('globalThis.__houston.currentItem') : null;
           writeAction(actionFile, {
             action: 'retry',
             riskLevel: 'low',
@@ -643,7 +684,7 @@ async function main() {
         } else if (cmd === 'u' || cmd === 'auto') {
           rl.close();
           const healed =
-            (await runGeminiLoop({ incident, cdp, model: flags.model, maxAllowedRisk, actionFile })) ||
+            (await runGeminiLoop({ incident, cdp, model: flags.model, maxAllowedRisk, allowCodePatches, actionFile })) ||
             (await runBuiltInLiveHealer({ incident, cdp, maxAllowedRisk, actionFile }));
           if (!healed) {
             writeAction(actionFile, {
@@ -657,7 +698,7 @@ async function main() {
           process.exit(0);
         } else if (cmd === 'e' || cmd === 'eval') {
           rl.question('JS Expression (e.g. globalThis.__houston.currentItem): ', async (expr) => {
-            const out = cdp ? await cdp.evalRuntime(expr) : 'No CDP connection';
+            const out = cdp ? await cdp.inspectRuntime(expr) : 'No CDP connection';
             console.log('Result:', out);
             promptUser();
           });
@@ -673,7 +714,9 @@ async function main() {
   promptUser();
 }
 
-const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname);
+const isDirectRun =
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
 if (isDirectRun) {
   main().catch((err) => {
     console.error('[Houston Agent Error]:', err);

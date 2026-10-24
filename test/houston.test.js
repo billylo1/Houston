@@ -3,7 +3,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { Houston, connectCDP } from '../src/index.js';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { Houston, connectCDP, isFileAllowed, isRiskAllowed } from '../src/index.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 test('Houston traps failure, self-assesses low risk, mutates live variable over V8 CDP, logs audit trail, and retries step', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'houston-test-'));
@@ -30,6 +35,7 @@ test('Houston traps failure, self-assesses low risk, mutates live variable over 
     },
     {
       item: brokenArticle,
+      relevantFiles: [__filename],
       incidentFile,
       actionFile,
     },
@@ -123,6 +129,85 @@ test('Houston prevents high-risk mutations before execution and blocks direct wr
   assert.equal(audit[0].riskLevel, 'high');
   assert.equal(audit[0].maxAllowedRisk, 'low');
   assert.equal(audit[0].fixedValue, null);
+});
+
+test('Houston fails closed when riskLevel is omitted, treating missing riskLevel as high (#2)', async () => {
+  assert.equal(isRiskAllowed(undefined, 'low'), false);
+  assert.equal(isRiskAllowed('', 'low'), false);
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'houston-fail-closed-'));
+  const auditLogPath = path.join(tmpDir, 'audit.jsonl');
+  const incidentFile = path.join(tmpDir, 'incident.json');
+  const actionFile = path.join(tmpDir, 'action.json');
+
+  const houston = new Houston({
+    mode: 'auto',
+    maxAllowedRisk: 'low',
+    auditLogPath,
+    silent: true,
+    onTrap: async () => ({
+      action: 'retry',
+      // riskLevel intentionally omitted -> must fail closed as 'high'
+      reason: 'Attempted retry without specifying riskLevel',
+    }),
+  });
+
+  const outcome = await houston.trap(
+    'missing-risk-step',
+    () => {
+      throw new Error('Validation failed');
+    },
+    { item: { id: 55 }, incidentFile, actionFile },
+  );
+
+  houston.close();
+
+  assert.equal(outcome, null);
+  const audit = houston.getAuditHistory();
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].action, 'blocked');
+  assert.equal(audit[0].riskLevel, 'high');
+});
+
+test('Houston enforces relevantFiles allowlist (#3) and CLI / exports / safeClone (#4, #5, #6)', async () => {
+  // #3: relevantFiles allowlist
+  assert.equal(isFileAllowed(__filename, [__filename]), true);
+  assert.equal(isFileAllowed('/etc/passwd', [__filename]), false);
+  assert.equal(isFileAllowed('.env', []), false);
+
+  // #4: bin/houston.js CLI --status
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'houston-cli-'));
+  const incidentFile = path.join(tmpDir, 'incident.json');
+  fs.writeFileSync(
+    incidentFile,
+    JSON.stringify({ stepId: 'cli-check', error: { message: 'boom' } }),
+    'utf8',
+  );
+  const binPath = path.resolve(__dirname, '../bin/houston.js');
+  const cliOut = execFileSync(process.execPath, [binPath, '--status', '--incident', incidentFile], {
+    encoding: 'utf8',
+  });
+  assert.equal(JSON.parse(cliOut).stepId, 'cli-check');
+
+  // #5: subpath export `houston-js/agent`
+  const agentModule = await import('houston-js/agent');
+  assert.equal(typeof agentModule.main, 'function');
+  assert.equal(typeof agentModule.connectCDP, 'function');
+
+  // #6: non-cloneable item with function preserves original error instead of DataCloneError
+  const houston = new Houston({ mode: 'off', silent: true });
+  await assert.rejects(
+    () =>
+      houston.trap(
+        'non-cloneable-step',
+        () => {
+          throw new Error('ORIGINAL_PIPELINE_ERROR');
+        },
+        { item: { id: 1, callback: () => 42 } },
+      ),
+    /ORIGINAL_PIPELINE_ERROR/,
+  );
+  houston.close();
 });
 
 test('Houston allows medium/high risk actions when maxAllowedRisk is explicitly configured to allow them', async () => {

@@ -11,10 +11,11 @@ export const RISK_LEVELS = {
 
 /**
  * Check if an assessed risk level is within the configured maximum allowed risk threshold.
+ * Fails closed: if `assessedRisk` is omitted or unrecognized, it defaults to 'high'.
  */
 export function isRiskAllowed(assessedRisk = 'high', maxAllowedRisk = 'low') {
-  const assessedRank = RISK_LEVELS[String(assessedRisk).toLowerCase()] ?? RISK_LEVELS.high;
-  const allowedRank = RISK_LEVELS[String(maxAllowedRisk).toLowerCase()] ?? RISK_LEVELS.low;
+  const assessedRank = RISK_LEVELS[String(assessedRisk || 'high').toLowerCase()] ?? RISK_LEVELS.high;
+  const allowedRank = RISK_LEVELS[String(maxAllowedRisk || 'low').toLowerCase()] ?? RISK_LEVELS.low;
   return assessedRank <= allowedRank;
 }
 
@@ -27,7 +28,7 @@ export function appendAuditEntry(entry, auditLogPath = DEFAULT_AUDIT_LOG_PATH) {
     stepId: entry.stepId || null,
     error: entry.error || null,
     action: entry.action || 'unknown',
-    riskLevel: entry.riskLevel || 'unknown',
+    riskLevel: entry.riskLevel || 'high',
     maxAllowedRisk: entry.maxAllowedRisk || 'low',
     riskJustification: entry.riskJustification || null,
     originalValue: entry.originalValue ?? null,
@@ -56,11 +57,13 @@ export function readAuditLog(auditLogPath = DEFAULT_AUDIT_LOG_PATH) {
     return [];
   }
   const lines = fs.readFileSync(resolvedPath, 'utf8').split('\n').filter(Boolean);
-  return lines.map((line) => {
-    try {
-      return JSON.parse(line);
-    } catch {
-      return null;
-    }
-  }).filter(Boolean);
+  return lines
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
 }

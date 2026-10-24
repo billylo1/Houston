@@ -1,12 +1,23 @@
 {
   "name": "houston-js",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Houston, we have a problem... Investigate it live and fix it for me! Self-healing runtime framework for Node.js using V8 Inspector and AI.",
+  "author": "Evergreen Labs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/billylo1/Houston.git"
+  },
+  "homepage": "https://github.com/billylo1/Houston#readme",
+  "bugs": {
+    "url": "https://github.com/billylo1/Houston/issues"
+  },
   "type": "module",
   "main": "./src/index.js",
   "exports": {
     ".": "./src/index.js",
-    "./audit": "./src/audit-logger.js"
+    "./audit": "./src/audit-logger.js",
+    "./agent": "./src/agent-runner.js"
   },
   "bin": {
     "houston": "./bin/houston.js"
@@ -16,6 +27,7 @@
     "bin/",
     "examples/",
     "README.md",
+    "SECURITY.md",
     "LICENSE"
   ],
   "scripts": {
@@ -35,7 +47,6 @@
     "debugger"
   ],
   "engines": {
-    "node": ">=22.0.0"
-  },
-  "license": "MIT"
+    "node": ">=22.4.0"
+  }
 }

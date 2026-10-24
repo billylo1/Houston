@@ -4,7 +4,7 @@
 
 **Houston** is a zero-dependency self-healing runtime framework for Node.js batch jobs, ETL pipelines, and scrapers.
 
-When a step fails, Houston prevents your process from crashing: it opens Node's native `node:inspector` (Chrome DevTools Protocol), pauses on the failure, and dispatches an AI agent (or interactive REPL) to **inspect live V8 variables, sanitize broken state in place or patch code on disk, record an audit trail, and resume execution without restarting the pipeline.**
+When a step fails, Houston prevents your process from crashing: it opens Node's native `node:inspector` (Chrome DevTools Protocol), pauses on the failure, and dispatches an AI agent (or interactive REPL) to **inspect live V8 variables, sanitize broken state in place or patch allowlisted code on disk, record an audit trail, and resume execution without restarting the pipeline.**
 
 ---
 
@@ -15,7 +15,8 @@ When a step fails, Houston prevents your process from crashing: it opens Node's 
 - **Autonomous AI & Offline Heuristic Modes**:
   - With `GOOGLE_API_KEY` or `GEMINI_API_KEY`, Gemini autonomously calls `inspect_runtime` (read-only), `mutate_runtime` (risk-gated), `read_code_file`, `patch_code_file`, and `complete_healing`.
   - Without an API key, Houston's built-in CDP live healer still inspects V8 memory and repairs common date/string formatting issues automatically.
-- **Pre-Execution Risk Self-Assessment & V8 Proxy Guard (`maxAllowedRisk`)**: The agent is required to self-assess the risk level (`low`, `medium`, or `high`) and justification **before** executing any mutation. `globalThis.__houston.currentItem` is wrapped in a read-only V8 `Proxy` during inspection; only `mutate_runtime` calls whose `riskLevel <= maxAllowedRisk` (default `'low'`) are permitted to reach V8. Medium or high-risk mutations (e.g., financial amounts, balances, permissions) are **prevented before execution** and logged as `"action": "blocked"` for human review.
+- **Cooperative Risk Self-Assessment & Guardrails (`maxAllowedRisk`)**: The agent is required to self-assess the risk level (`low`, `medium`, or `high`) and justification before executing any mutation (failing closed to `high` if omitted). `globalThis.__houston.currentItem` is wrapped in a V8 `Proxy` during inspection; only `mutate_runtime` calls whose `riskLevel <= maxAllowedRisk` (default `'low'`) are permitted to run. Medium or high-risk mutations (e.g., financial amounts, balances, permissions) are blocked and logged as `"action": "blocked"` for human review.
+- **File Allowlist (`relevantFiles` & `allowCodePatches`)**: `read_code_file` and `patch_code_file` are restricted to files explicitly listed in `relevantFiles`, and code patching is opt-in (`allowCodePatches: false` by default).
 - **Human-in-the-Loop Audit Log (`houston_audit.jsonl`)**: Every autonomous fix or blocked high-risk action is logged as structured JSONL (original value, fixed value, assessed risk level, risk justification, error, and reasoning) so engineers can review and harden upstream validators the next morning.
 
 ---
@@ -25,7 +26,7 @@ When a step fails, Houston prevents your process from crashing: it opens Node's 
 ### 1. Install
 
 ```bash
-npm install houston-js
+npm install github:billylo1/Houston
 ```
 
 ### 2. Wrap Batch Steps with `houston.trap()`
@@ -38,6 +39,7 @@ const houston = new Houston({
   model: 'gemini-3.8-flash',
   maxAllowedRisk: 'low', // 'low' (default) | 'medium' | 'high'
   onRiskExceeded: 'skip', // 'skip' (default) | 'throw'
+  allowCodePatches: false, // opt-in disk patching on `relevantFiles`
   auditLogPath: './houston_audit.jsonl',
   maxRetries: 2,
 });
@@ -101,7 +103,9 @@ npm run example
 | :--- | :--- | :--- |
 | **`low`** | Date format conversion (`DD/MM/YYYY` → `YYYY-MM-DD`), trimming whitespace, casing normalization | ✅ **Auto-executed in V8 memory** |
 | **`medium`** | Defaulting optional non-financial metadata (e.g., missing category tag), updating non-destructive CSS selectors | 🛑 **Blocked & logged** (unless `maxAllowedRisk: 'medium'` or `'high'`) |
-| **`high`** | Modifying financial amounts (`royaltyFee`, `price`, `balance`), inventory quantities, user IDs, or auth permissions | 🛑 **Prevented before execution & logged** (unless `maxAllowedRisk: 'high'`) |
+| **`high`** | Modifying financial amounts (`royaltyFee`, `price`, `balance`), inventory quantities, user IDs, or auth permissions | 🛑 **Blocked & logged** (unless `maxAllowedRisk: 'high'`) |
+
+> **Security Note:** Houston's V8 `Proxy` and `maxAllowedRisk` gates act as a cooperative guardrail against unintended LLM mutations inside the same Node.js process. See [`SECURITY.md`](./SECURITY.md) for details on the threat model, `relevantFiles` allowlist, and local inspector considerations.
 
 ---
 

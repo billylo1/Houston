@@ -26,9 +26,24 @@ if (!globalThis.__houston) {
 }
 
 /**
- * Wraps an object in a recursive V8 Proxy that prevents any property mutation or deletion
- * unless `globalThis.__houston.__mutationAuthorized === true` (unlocked only by risk-approved
- * `mutateRuntime` calls).
+ * Safe clone that never throws `DataCloneError` when an item contains functions or class instances.
+ */
+export function safeClone(value) {
+  if (value === null || typeof value !== 'object') return value;
+  try {
+    return structuredClone(value);
+  } catch {
+    try {
+      return JSON.parse(JSON.stringify(value));
+    } catch {
+      return null;
+    }
+  }
+}
+
+/**
+ * Wraps an object in a recursive V8 Proxy that prevents accidental property mutation
+ * during read-only `inspectRuntime()` calls unless unlocked by `mutateRuntime()`.
  */
 export function createRiskGuardedProxy(target) {
   if (target === null || typeof target !== 'object') {
@@ -37,6 +52,9 @@ export function createRiskGuardedProxy(target) {
   return new Proxy(target, {
     get(obj, prop, receiver) {
       const value = Reflect.get(obj, prop, receiver);
+      if (typeof value === 'function') {
+        return value.bind(obj);
+      }
       if (value !== null && typeof value === 'object') {
         return createRiskGuardedProxy(value);
       }
@@ -85,7 +103,7 @@ export function ensureInspector(port = 9229, inspectorUrlFile = DEFAULT_INSPECTO
   const url = inspector.url();
   if (url && inspectorUrlFile) {
     try {
-      fs.writeFileSync(inspectorUrlFile, url, 'utf8');
+      fs.writeFileSync(inspectorUrlFile, url, { encoding: 'utf8', mode: 0o600 });
     } catch {
       // ignore
     }
@@ -139,11 +157,13 @@ export function writeIncident({
   attempt,
   maxRetries,
   maxAllowedRisk = 'low',
+  allowCodePatches = false,
   relevantFiles = [],
   inspectorUrl,
   auditLogPath,
   incidentFile = DEFAULT_INCIDENT_FILE,
   actionFile = DEFAULT_ACTION_FILE,
+  itemSnapshot = null,
 }) {
   const incident = {
     timestamp: new Date().toISOString(),
@@ -151,6 +171,7 @@ export function writeIncident({
     attempt,
     maxRetries,
     maxAllowedRisk,
+    allowCodePatches,
     error: {
       name: error?.name || 'Error',
       message: error?.message || String(error),
@@ -160,10 +181,10 @@ export function writeIncident({
     inspectorUrl: inspectorUrl || inspector.url() || null,
     auditLogPath,
     actionFile,
-    currentItemPreview: globalThis.__houston.currentItem ?? null,
+    currentItemPreview: itemSnapshot,
   };
 
-  fs.writeFileSync(incidentFile, JSON.stringify(incident, null, 2), 'utf8');
+  fs.writeFileSync(incidentFile, JSON.stringify(incident, null, 2), { encoding: 'utf8', mode: 0o600 });
   return incident;
 }
 
@@ -185,6 +206,7 @@ export async function spawnAgentRunner({
   mode,
   model,
   maxAllowedRisk = 'low',
+  allowCodePatches = false,
   incidentFile,
   actionFile,
   auditLogPath,
@@ -204,6 +226,9 @@ export async function spawnAgentRunner({
 
   if (mode === 'auto') {
     args.push('--auto');
+  }
+  if (allowCodePatches) {
+    args.push('--allow-code-patches');
   }
 
   if (process.stdin.isTTY || mode === 'auto') {
@@ -227,17 +252,20 @@ export async function spawnAgentRunner({
 export async function waitForResolution({
   actionFile = DEFAULT_ACTION_FILE,
   timeoutMs = 180000,
-  pollIntervalMs = 250,
+  pollIntervalMs = 100,
 } = {}) {
+  const immediate = readAndConsumeAction(actionFile);
+  if (immediate) return immediate;
+
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
     const action = readAndConsumeAction(actionFile);
     if (action) {
       return action;
     }
-    await new Promise((r) => setTimeout(r, pollIntervalMs));
   }
-  return { action: 'timeout', reason: `Timed out after ${timeoutMs / 1000}s` };
+  return { action: 'timeout', riskLevel: 'low', reason: `Timed out after ${timeoutMs / 1000}s` };
 }
 
 /**
@@ -249,6 +277,7 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
     model = 'gemini-3.8-flash',
     maxAllowedRisk = 'low',
     onRiskExceeded = 'skip',
+    allowCodePatches = false,
     maxRetries = 2,
     timeoutMs = 180000,
     port = 9229,
@@ -264,8 +293,6 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
     silent = false,
   } = options;
 
-  // Bind state into globalThis.__houston so live CDP expressions can inspect it,
-  // while wrapping `currentItem` in a RiskGuardedProxy to prevent unauthorized mutations.
   Object.assign(globalThis.__houston.context, context);
   globalThis.__houston.currentStep = stepId;
   globalThis.__houston.maxAllowedRisk = maxAllowedRisk;
@@ -289,8 +316,7 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
         throw error;
       }
 
-      const originalSnapshot = item !== null ? structuredClone(item) : null;
-
+      const originalSnapshot = safeClone(item);
       const inspectorUrl = ensureInspector(port, inspectorUrlFile);
       clearFile(actionFile);
 
@@ -300,18 +326,19 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
         attempt: attempts,
         maxRetries,
         maxAllowedRisk,
+        allowCodePatches,
         relevantFiles,
         inspectorUrl,
         auditLogPath,
         incidentFile,
         actionFile,
+        itemSnapshot: originalSnapshot,
       });
 
       if (!silent) {
         printHoustonBanner({ stepId, error, inspectorUrl, incidentFile, mode, maxAllowedRisk });
       }
 
-      // Pause V8 for any attached CDP debugger
       debugger;
 
       if (typeof onTrap === 'function') {
@@ -325,13 +352,14 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
           context: globalThis.__houston.context,
         });
         if (customDecision && customDecision.action) {
-          fs.writeFileSync(actionFile, JSON.stringify(customDecision, null, 2), 'utf8');
+          fs.writeFileSync(actionFile, JSON.stringify(customDecision, null, 2), { encoding: 'utf8', mode: 0o600 });
         }
       } else {
         await spawnAgentRunner({
           mode,
           model,
           maxAllowedRisk,
+          allowCodePatches,
           incidentFile,
           actionFile,
           auditLogPath,
@@ -340,7 +368,9 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
       }
 
       const resolution = await waitForResolution({ actionFile, timeoutMs });
-      const assessedRisk = (resolution.riskLevel || 'low').toLowerCase();
+      // Fail-closed: if `riskLevel` is omitted on a retry/blocked resolution, default to 'high'
+      const defaultRisk = resolution.action === 'skip' || resolution.action === 'timeout' ? 'low' : 'high';
+      const assessedRisk = String(resolution.riskLevel || defaultRisk).toLowerCase();
       const riskJustification = resolution.riskJustification || null;
 
       // Enforce Risk Guardrail: block any healing action whose assessed risk exceeds maxAllowedRisk
@@ -389,7 +419,7 @@ export async function executeWithHoustonTrap(stepId, fn, options = {}) {
         originalValue: resolution.originalValue ?? originalSnapshot,
         fixedValue:
           resolution.action === 'retry'
-            ? (item !== null ? structuredClone(item) : resolution.fixedValue)
+            ? (item !== null ? safeClone(item) : resolution.fixedValue)
             : null,
         reason: resolution.reason || resolution.summary || `Resolved with ${resolution.action}`,
         filesPatched: resolution.filesPatched || [],
