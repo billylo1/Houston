@@ -6,6 +6,8 @@
 
 When a step fails, Houston prevents your process from crashing: it opens Node's native `node:inspector` (Chrome DevTools Protocol), pauses on the failure, and dispatches an AI agent (or interactive REPL) to **inspect live V8 variables, sanitize broken state in place or patch allowlisted code on disk, record an audit trail, and resume execution without restarting the pipeline.**
 
+📖 **Read the background story & architecture write-up:** [Houston, We Have a Problem: I am self-inspecting live and self-fixing if the risk is low.](https://evergreen-labs.org/blog/self-healing-nodejs-v8-inspector)
+
 ---
 
 ## Features
